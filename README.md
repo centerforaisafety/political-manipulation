@@ -1,5 +1,7 @@
 # Reducing Political Manipulation with Consistency Training 
 
-Website: https://political-manipulation.ai/
+See website for examples: https://political-manipulation.ai/
+
+For AI Agents: https://political-manipulation.ai/llms.txt
 
 .....Code Coming Soon.....
