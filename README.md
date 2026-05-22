@@ -1,2 +1,6 @@
-# political-manipulation
+# Political 
 Reducing Political Manipulation with Consistency Training
+
+
+.....Code Coming Soon.....
+
