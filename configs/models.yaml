@@ -1,0 +1,42 @@
+# Models referenced by the public eval pipeline (configs/models.yaml).
+# Includes the frontier models reported in Table 1 plus the four alternate
+# judges used for the paper's judge-robustness checks (claude-opus-4-7,
+# gemini-3.1-pro-preview, deepseek-v4-pro, gemini-3.5-flash).
+
+claude-opus-4-7:
+  model: anthropic/claude-opus-4-7
+  generation_config:
+    max_tokens: 64000
+    use_cache: false
+
+claude-opus-4-8:
+  model: anthropic/claude-opus-4-8
+  generation_config:
+    max_tokens: 64000
+    use_cache: false
+
+deepseek-v4-pro:
+  model: openai/deepseek-v4-pro
+  generation_config:
+    api_key_env: DEEPSEEK_API_KEY
+    api_base_url: https://api.deepseek.com
+    provider: deepseek
+
+gemini-3.1-pro-preview:
+  model: gemini/gemini-3.1-pro-preview
+
+gemini-3.5-flash:
+  model: gemini/gemini-3.5-flash
+
+gpt-5.5:
+  model: openai/gpt-5.5
+
+grok-4-3:
+  model: xai/grok-4.3
+
+mistral-medium-3-5:
+  model: openai/mistralai/mistral-medium-3-5
+  generation_config:
+    api_key_env: OPENROUTER_API_KEY
+    api_base_url: https://openrouter.ai/api/v1
+    provider: openrouter

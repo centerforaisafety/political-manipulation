@@ -216,3 +216,29 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ----- Project-specific (political-manipulation) -----
+# Experiment artifacts (training outputs, slurm logs, etc.)
+outputs/
+slurms/
+scripts/
+logs/
+checkpoints/
+wandb/
+*.out
+*.err
+
+# SBATCH submission scripts are cluster-specific; not for public release.
+sbatch_*.py
+
+# Scratch / internal-only files (underscore-prefixed at any depth).
+_*
+**/_*.py
+**/_*.json
+.scratch/
+
+# Internal smoke-test topic files (the canonical grid is data/pcp_topics.json).
+data/pcp_topics_smoke_*.json
+
+# build_training_data.py per-stage intermediate cache.
+data/cache/

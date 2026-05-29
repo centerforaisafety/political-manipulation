@@ -1,0 +1,734 @@
+import asyncio
+import json
+import os
+import re
+import yaml
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Dict, Any
+
+import anthropic
+import openai
+from pydantic import BaseModel
+import litellm
+import requests
+litellm.suppress_debug_info = True
+try:
+    _model_cost_url = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    _model_cost_data = requests.get(_model_cost_url, timeout=10).json()
+    # Filter out github_copilot models that trigger OAuth prompts
+    _filtered_model_cost = {k: v for k, v in _model_cost_data.items() if not k.startswith("github_copilot/")}
+    litellm.register_model(model_cost=_filtered_model_cost)
+    # Register missing OpenAI model aliases from azure pricing.
+    # Covers unversioned (gpt-5.4-nano) AND date-stamped (gpt-5.4-nano-2026-03-17)
+    # variants that OpenAI's API returns in `response.model`.
+    for _prefix in ['gpt-5.4-mini', 'gpt-5.4-nano']:
+        for _azure_key, _info in _filtered_model_cost.items():
+            if _azure_key.startswith(f'azure/{_prefix}'):
+                _openai_name = _azure_key[len('azure/'):]
+                if _openai_name not in litellm.model_cost:
+                    _entry = dict(_info)
+                    _entry['litellm_provider'] = 'openai'
+                    litellm.register_model(model_cost={_openai_name: _entry})
+
+    # DeepSeek-V4-Pro: not yet in litellm registry.
+    # 75% discount until 2026-05-31 15:59 UTC (per https://api-docs.deepseek.com/quick_start/pricing).
+    # Discounted rates per 1M tokens: cache hit $0.003625, cache miss $0.435, output $0.87.
+    _deepseek_v4_pro = {
+        "input_cost_per_token": 0.435e-6,
+        "input_cost_per_token_cache_hit": 0.003625e-6,
+        "cache_read_input_token_cost": 0.003625e-6,
+        "output_cost_per_token": 0.87e-6,
+        "litellm_provider": "deepseek",
+        "mode": "chat",
+    }
+    for _key in ("deepseek/deepseek-v4-pro", "deepseek-v4-pro", "openai/deepseek-v4-pro"):
+        litellm.register_model(model_cost={_key: dict(_deepseek_v4_pro)})
+
+    # DeepSeek-V4-Flash: not yet in litellm registry.
+    # Standard rates per 1M tokens: cache hit $0.0028, cache miss $0.14, output $0.28.
+    _deepseek_v4_flash = {
+        "input_cost_per_token": 0.14e-6,
+        "input_cost_per_token_cache_hit": 0.0028e-6,
+        "cache_read_input_token_cost": 0.0028e-6,
+        "output_cost_per_token": 0.28e-6,
+        "litellm_provider": "deepseek",
+        "mode": "chat",
+    }
+    for _key in ("deepseek/deepseek-v4-flash", "deepseek-v4-flash", "openai/deepseek-v4-flash"):
+        litellm.register_model(model_cost={_key: dict(_deepseek_v4_flash)})
+
+    # Mistral Medium 3.5 (via OpenRouter): not yet in litellm registry.
+    # OpenRouter rates per 1M tokens: input $1.50, output $7.50.
+    _mistral_medium_35 = {
+        "input_cost_per_token": 1.5e-6,
+        "output_cost_per_token": 7.5e-6,
+        "litellm_provider": "openrouter",
+        "mode": "chat",
+    }
+    litellm.register_model(model_cost={"openrouter/mistralai/mistral-medium-3-5": dict(_mistral_medium_35)})
+except Exception as e:
+    print(f"Warning: Failed to load remote model costs: {e}")
+
+from dotenv import load_dotenv
+load_dotenv()
+TIMEOUT=600
+print(f"TIMEOUT: {TIMEOUT}")
+
+def get_llm_agent_class(model: str, generation_config: dict = {}, **kwargs):
+  # vLLM short-circuit: `vllm/<path-or-hf-id>`. Skips configs/models.yaml entirely.
+  # The remainder after `vllm/` is treated as a model path or HF repo id, and
+  # LoRA adapters are auto-detected via adapter_config.json. Anything passed in
+  # `generation_config` becomes a VLLMAgent kwarg (tensor_parallel_size,
+  # enable_thinking, max_tokens, etc.).
+  if model.startswith("vllm/"):
+    return VLLMAgent(model=model[len("vllm/"):], **generation_config, **kwargs)
+
+  provider, model_name = model.split("/", 1)
+
+  provider_to_class = {
+    'openai': OpenAIAgent,
+    'anthropic': AnthropicAgent,
+    'gemini': GeminiAgent,
+    'xai': GrokAgent,
+    'openrouter': OpenRouterAgent,
+  }
+  assert provider in provider_to_class, f"Provider {provider} not supported"
+  return provider_to_class[provider](model=model_name, **generation_config, **kwargs)
+
+
+def load_agent(model: str, **kwargs) -> "LLMAgent":
+  """One-call agent loader. Strings starting with `vllm/` skip
+  configs/models.yaml and load directly via VLLMAgent (LoRA adapters
+  auto-detected); anything else is resolved through the yaml."""
+  if model.startswith("vllm/"):
+    return VLLMAgent(model=model[len("vllm/"):], **kwargs)
+  config = get_agent_config(model)
+  return get_llm_agent_class(**config, **kwargs)
+
+
+class TokenUsage(BaseModel):
+  input_tokens: int = 0
+  output_tokens: int = 0
+  total_tokens: int = 0
+  cached_tokens: int = 0
+  cost: float = 0.0
+
+class LLMResponse(BaseModel):
+  content: str | None = None
+  reasoning_content: str | None = None
+  token_usage: TokenUsage | None = None
+  raw: dict | None = None
+
+
+class LLMAgent(ABC):
+  def __init__(self, model: str, provider: str = None):
+    self.model = model
+    self.provider = provider
+    self.all_token_usage = TokenUsage()
+    self.max_token_usage = TokenUsage()
+    self._usage_lock = asyncio.Lock()  # Lock for async usage updates
+    # Local-engine agents (vLLM, sglang, …) batch concurrent submissions
+    # internally and should NOT be wrapped in an external semaphore — doing
+    # so caps how many prompts the engine can see at once and kills throughput.
+    # API agents leave this False and rely on caller-side rate limiting.
+    self.batches_internally: bool = False
+
+  def _update_usage(self, token_usage: TokenUsage):
+    self.all_token_usage = sum_token_usage([self.all_token_usage, token_usage])
+    self.max_token_usage = get_max_token_usage([self.max_token_usage, token_usage])
+
+  async def _update_usage_async(self, token_usage: TokenUsage):
+    """Update token usage asynchronously with lock (for concurrent async calls)."""
+    async with self._usage_lock:
+      self.all_token_usage = sum_token_usage([self.all_token_usage, token_usage])
+      self.max_token_usage = get_max_token_usage([self.max_token_usage, token_usage])
+    
+  def _calculate_cost(self, response: Any) -> float:
+    # Add total_tokens field if missing (e.g., Anthropic responses don't have this)
+    usage = getattr(response, 'usage', None)
+    if usage and not hasattr(usage, 'total_tokens'):
+      usage.total_tokens = getattr(usage, 'input_tokens', 0) + getattr(usage, 'output_tokens', 0)
+
+    # OpenRouter returns the exact cost in `usage.cost` — trust it directly.
+    upstream_cost = getattr(usage, "cost", None)
+    if upstream_cost is not None:
+      return float(upstream_cost)
+    # xAI returns `usage.cost_in_usd_ticks` (1 tick = $1e-10).
+    ticks = getattr(usage, "cost_in_usd_ticks", None)
+    if ticks is not None:
+      return float(ticks) * 1e-10
+
+    # Strip the date suffix from versioned model names (e.g.,
+    # `gpt-5.4-nano-2026-03-17` → `gpt-5.4-nano`) so litellm's pricing lookup
+    # hits the base key registered in model_prices_and_context_window.json.
+    import re as _re
+    base_model = getattr(response, "model", None) or self.model
+    if base_model:
+      base_model = _re.sub(r"-\d{4}-\d{2}-\d{2}$", "", base_model)
+
+    try:
+      cost = litellm.cost_calculator.completion_cost(
+        completion_response=response,
+        model=base_model,
+        custom_llm_provider=self.provider,
+      )
+    except Exception:
+      cost = 0.0
+
+    # Recover hidden thinking tokens (Gemini/xAI via OpenAI-compat hide them in total_tokens).
+    pt = getattr(usage, "prompt_tokens", None)
+    ct = getattr(usage, "completion_tokens", None)
+    if pt is not None and ct is not None:
+      hidden = usage.total_tokens - pt - ct
+      if hidden > 0:
+        info = (litellm.model_cost.get(base_model)
+                or litellm.model_cost.get(f"{self.provider}/{base_model}")
+                or litellm.model_cost.get(base_model.split("/", 1)[-1]) or {})
+        cost = (cost or 0.0) + hidden * (info.get("output_cost_per_token") or 0)
+
+    return cost
+
+  @abstractmethod
+  def _completions(self, messages) -> LLMResponse:
+    raise NotImplementedError
+
+  @abstractmethod
+  async def _async_completions(self, messages) -> LLMResponse:
+    raise NotImplementedError
+
+  def completions(self, messages: list[dict], **kwargs) -> LLMResponse:
+    return self._completions(messages, **kwargs)
+
+  async def async_completions(self, messages: list[dict], **kwargs) -> LLMResponse:
+    return await self._async_completions(messages, **kwargs)
+
+class OpenAIAgent(LLMAgent):
+  def __init__(self, 
+               model: str,
+               api_key_env: str = 'OPENAI_API_KEY',
+               api_base_url: str = os.getenv('OPENAI_API_BASE_URL', 'https://api.openai.com/v1'),
+               provider: str = 'openai',
+               **generation_config):
+    super().__init__(model=model, provider=provider)
+
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+      raise ValueError(f"API key not found in environment variable {api_key_env}")
+
+    self.client = openai.OpenAI(api_key=api_key, base_url=api_base_url, timeout=TIMEOUT)
+    self.async_client = openai.AsyncOpenAI(api_key=api_key, base_url=api_base_url, timeout=TIMEOUT)
+    self.generation_config = generation_config
+
+  def _preprocess_messages(self, messages: list[dict]) -> list[dict]:
+    return messages
+
+  def _parse_response(self, response):
+    """Parse response and extract content, token usage, and cost."""
+    message = response.choices[0].message
+    content = message.content
+    # Capture reasoning_content if present (e.g., DeepSeek reasoner models)
+    reasoning_content = getattr(message, 'reasoning_content', None)
+    usage = response.usage
+    cached_tokens = getattr(getattr(usage, 'prompt_tokens_details', None), 'cached_tokens', 0)
+
+    cost = self._calculate_cost(response)
+    token_usage = TokenUsage(
+      input_tokens=usage.prompt_tokens,
+      output_tokens=usage.completion_tokens,
+      total_tokens=usage.total_tokens,
+      cached_tokens=cached_tokens,
+      cost=cost,
+    )
+
+    # Convert response to dict for raw logging
+    raw_response = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
+
+    return content, reasoning_content, token_usage, raw_response
+
+  def _completions(self, messages: list[dict], **kwargs) -> LLMResponse:
+    messages = self._preprocess_messages(messages)
+    response = self.client.chat.completions.create(
+      model=self.model,
+      messages=messages,
+      **self.generation_config,
+      **kwargs,
+    )
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
+    self._update_usage(token_usage)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
+
+  async def _async_completions(self, messages: list[dict], **kwargs) -> LLMResponse:
+    messages = self._preprocess_messages(messages)
+    response = await self.async_client.chat.completions.create(
+      model=self.model,
+      messages=messages,
+      **self.generation_config,
+      **kwargs,
+    )
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
+    await self._update_usage_async(token_usage)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
+
+
+class GrokAgent(OpenAIAgent):
+  def __init__(self, model: str,
+               api_key_env: str = 'XAI_API_KEY',
+               api_base_url: str = 'https://api.x.ai/v1', 
+               provider: str = 'xai',
+               **generation_config):
+    super().__init__(model=model, 
+                     api_key_env=api_key_env, 
+                     api_base_url=api_base_url, 
+                     provider=provider,
+                     **generation_config)
+    # Check if this is a grok-4 model that needs conversation flattening
+    self.needs_flattening = 'grok-4' in model.lower() and "grok-4-fast" not in model.lower()
+  
+  def _flatten_conversation(self, messages: list[dict]) -> list[dict]:
+    """Flatten multi-turn conversation for Grok-4 model. This is because Grok-4 constantly give errors on multi-turn conversations.
+    
+    Converts user/assistant pairs into single message with USER:/ASSISTANT: markers.
+    """
+    if not messages:
+      return messages
+    
+    # Separate system from conversation messages
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    conv_msgs = [m for m in messages if m["role"] != "system"]
+    
+    # No flattening needed for N message yet
+    if len(conv_msgs) <= 4:
+      return messages
+    
+    # Extract text content, handling both string and list formats
+    def get_text(content):
+      if isinstance(content, str):
+        return content
+      if isinstance(content, list):
+        return " ".join(item.get("text", str(item)) for item in content if isinstance(item, dict))
+      return str(content)
+    
+    # Build flattened conversation with USER:/ASSISTANT: markers
+    flattened = "\n\n".join(f"{m['role'].upper()}: {get_text(m['content'])}" for m in conv_msgs)
+    
+    return system_msgs + [{"role": "user", "content": flattened}]
+  
+  def _preprocess_messages(self, messages: list[dict]) -> list[dict]:
+    """Preprocess messages, applying flattening for Grok-4 models."""
+    if self.needs_flattening:
+      return self._flatten_conversation(messages)
+    return messages
+ 
+class GeminiAgent(OpenAIAgent):
+  def __init__(self, model: str, 
+               api_key_env: str = 'GEMINI_API_KEY',
+               api_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/",
+               provider: str = 'gemini',
+               vertexai: bool = False,
+               **generation_config):
+
+    if not vertexai:
+        super().__init__(model=model,
+                         api_key_env=api_key_env, 
+                         api_base_url=api_base_url, 
+                         provider=provider,
+                         **generation_config)
+    else:
+        # https://colab.research.google.com/github/GoogleCloudPlatform/generative-ai/blob/main/gemini/chat-completions/intro_chat_completions_api.ipynb
+        from google.auth import default
+        from google.auth.transport.requests import Request
+        
+        if not os.environ.get("GOOGLE_CLOUD_PROJECT") or not os.environ.get("GOOGLE_CLOUD_LOCATION"):
+            raise ValueError("GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION environment variables must be set")
+        
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION")
+        
+        credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        credentials.refresh(Request())
+        
+        api_host = f"{location}-aiplatform.googleapis.com" if location != "global" else "aiplatform.googleapis.com"
+        api_base_url = f"https://{api_host}/v1/projects/{project_id}/locations/{location}/endpoints/openapi"
+        api_key = credentials.token
+        # Only add google/ prefix for Google's own models, not third-party Vertex AI models
+        if "/" not in model:
+            model = f"google/{model}"
+
+        # Initialize base class attributes (vertexai path doesn't call super().__init__)
+        LLMAgent.__init__(self, model=model, provider='vertex_ai')
+        self.client = openai.OpenAI(api_key=api_key, base_url=api_base_url, timeout=TIMEOUT)
+        self.async_client = openai.AsyncOpenAI(api_key=api_key, base_url=api_base_url, timeout=TIMEOUT)
+        self.generation_config = generation_config
+
+class AnthropicAgent(LLMAgent):
+  def __init__(self, model: str,
+               use_cache: bool = False,
+               vertexai: bool = False,
+               provider: str = 'anthropic',
+               api_key_env: str = 'ANTHROPIC_API_KEY',
+               **generation_config):
+    # Determine provider before parent init
+    provider = 'vertex_ai' if vertexai else provider
+    super().__init__(model=model, provider=provider)
+
+    if vertexai:
+      # pip install --upgrade anthropic[vertexai]
+      region = os.getenv('GOOGLE_CLOUD_LOCATION', 'global')
+      project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+      assert project_id, "GOOGLE_CLOUD_PROJECT environment variable must be set for Vertex AI"
+      self.client = anthropic.AnthropicVertex(region=region, project_id=project_id, timeout=TIMEOUT)
+      self.async_client = anthropic.AsyncAnthropicVertex(region=region, project_id=project_id, timeout=TIMEOUT)
+    else:
+      api_key = os.getenv(api_key_env)
+      assert api_key, f"{api_key_env} environment variable not set"
+      self.client = anthropic.Anthropic(api_key=api_key, timeout=TIMEOUT)
+      self.async_client = anthropic.AsyncAnthropic(api_key=api_key, timeout=TIMEOUT)
+    
+    # Extract cache setting from generation_config
+    self.use_cache = use_cache
+    self.generation_config = generation_config
+
+  def _preprocess_messages(self, messages: list[dict]) -> list[dict]:
+    system = None
+    caching_messages = []
+    # https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+    # As of June 2025, Anthropic does not support auto-caching but need to define the final block as caching
+    for i, message in enumerate(messages):
+      if message["role"] == "system":
+        system = [dict(type="text", text=message["content"])]
+      else:
+        new_block = {"role": message["role"]}
+        
+        # Handle both string content and multimodal content (list)
+        if isinstance(message["content"], str):
+          # Simple text message
+          if self.use_cache and i == len(messages) - 1:
+            content = [dict(type="text", text=message['content'], cache_control={"type": "ephemeral"})]
+          else:
+            content = [dict(type="text", text=message['content'])]
+        elif isinstance(message["content"], list):
+          # Multimodal message with text and images
+          content = []
+          for item in message["content"]:
+            if item["type"] == "text":
+              # Add cache_control to the last text block of the last message (only if caching enabled)
+              if self.use_cache and i == len(messages) - 1 and item == message["content"][-1]:
+                content.append(dict(type="text", text=item["text"], cache_control={"type": "ephemeral"}))
+              else:
+                content.append(dict(type="text", text=item["text"]))
+            elif item["type"] == "image_url":
+              # Convert OpenAI-style image_url to Anthropic format
+              image_url = item["image_url"]["url"]
+              if image_url.startswith("data:image/"):
+                # Extract media type and base64 data
+                media_type, base64_data = image_url.split(";base64,")
+                media_type = media_type.replace("data:", "")
+                content.append({
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64_data
+                  }
+                })
+        else:
+          # Fallback for unexpected content types
+          if self.use_cache and i == len(messages) - 1:
+            content = [dict(type="text", text=str(message['content']), cache_control={"type": "ephemeral"})]
+          else:
+            content = [dict(type="text", text=str(message['content']))]
+        
+        new_block["content"] = content
+        caching_messages.append(new_block)
+    
+    return system, caching_messages
+
+  def _parse_response(self, response):
+    """Parse response and extract content, token usage, and cost."""
+    content = response.content[-1].text
+    usage = response.usage
+    cost = self._calculate_cost(response)
+
+    token_usage = TokenUsage(
+      input_tokens=usage.input_tokens + usage.cache_creation_input_tokens,
+      output_tokens=usage.output_tokens,
+      cached_tokens=usage.cache_read_input_tokens,
+      total_tokens=usage.input_tokens + usage.output_tokens,
+      cost=cost,
+    )
+
+    # Convert response to dict for raw logging
+    raw_response = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
+
+    return content, None, token_usage, raw_response
+
+  def _completions(self, messages: list[dict]) -> str:
+    system, messages = self._preprocess_messages(messages)
+    kwargs = {
+      "model": self.model,
+      "messages": messages,
+      **self.generation_config
+    }
+    if system is not None:
+      kwargs["system"] = system
+
+    response = self.client.messages.create(**kwargs)
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
+    self._update_usage(token_usage)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
+
+  async def _async_completions(self, messages: list[dict]) -> LLMResponse:
+    system, messages = self._preprocess_messages(messages)
+    kwargs = {
+      "model": self.model,
+      "messages": messages,
+      **self.generation_config
+    }
+    if system is not None:
+      kwargs["system"] = system
+
+    response = await self.async_client.messages.create(**kwargs)
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
+    await self._update_usage_async(token_usage)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
+
+class OpenRouterAgent(OpenAIAgent):
+  def __init__(self, model: str,
+               api_key_env: str = 'OPENROUTER_API_KEY',
+               api_base_url: str = 'https://openrouter.ai/api/v1',
+               provider: str = 'openrouter',
+               **generation_config):
+    super().__init__(model=model,
+                     api_key_env=api_key_env,
+                     api_base_url=api_base_url,
+                     provider=provider,
+                     **generation_config)
+
+
+class VLLMAgent(LLMAgent):
+  """vLLM-backed local agent.
+
+  Constructed from a model path (or HF repo id). If the path contains an
+  ``adapter_config.json``, it is treated as a LoRA adapter on top of the base
+  model recorded in that config. Use via `vllm/<path>` in `get_llm_agent_class`,
+  e.g. ``vllm/outputs/grpo_Qwen3-14B_209880/checkpoint-1000``.
+
+  Exposes `batch_completions(list[list[dict]])` for efficient batched
+  generation (preferred for evals over the per-call async API), plus the
+  standard `_completions` / `_async_completions` for compatibility with the
+  shared judge-call code paths.
+  """
+
+  def __init__(self,
+               model: str,
+               tensor_parallel_size: int = 1,
+               enable_thinking: bool = False,
+               enforce_eager: bool = True,
+               max_model_len: int = 12288,
+               max_tokens: int = 10000,
+               provider: str = 'vllm',
+               gpu_memory_utilization: float = 0.9,
+               **sampling_kwargs):
+    super().__init__(model=model, provider=provider)
+    self.batches_internally = True  # vLLM batches internally via the queue worker
+    # Lazy imports — keeps non-vLLM workflows from paying the import cost.
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
+    from transformers import AutoTokenizer
+
+    # Force-exit on Python shutdown to avoid hanging on vLLM worker subprocess
+    # teardown. atexit handlers fire before Python's normal subprocess cleanup,
+    # so this skips the wait-for-children loop that holds the SLURM job open
+    # after main() finishes. Registered once per VLLMAgent instance.
+    import atexit
+    atexit.register(lambda: os._exit(0))
+
+    self.model_path = model
+    self.enable_thinking = enable_thinking
+
+    adapter_config_path = os.path.join(model, "adapter_config.json")
+    self.lora_request = None
+    if os.path.exists(adapter_config_path):
+      with open(adapter_config_path, "r") as f:
+        adapter_cfg = json.load(f)
+      base_model = adapter_cfg.get("base_model_name_or_path")
+      print(f"[VLLMAgent] LoRA adapter detected. base={base_model} adapter={model}")
+      self.llm = LLM(
+        model=base_model,
+        tensor_parallel_size=tensor_parallel_size,
+        trust_remote_code=True,
+        enable_lora=True,
+        max_lora_rank=adapter_cfg.get("r", 64),
+        enforce_eager=enforce_eager,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+      )
+      self.lora_request = LoRARequest("eval_adapter", 1, model)
+      self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    else:
+      print(f"[VLLMAgent] Loading model: {model}")
+      self.llm = LLM(
+        model=model,
+        tensor_parallel_size=tensor_parallel_size,
+        trust_remote_code=True,
+        enforce_eager=enforce_eager,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+      )
+      self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    # Defer to vLLM defaults (temperature=1.0, top_p=1.0) unless the caller
+    # explicitly overrides them via sampling_kwargs from models.yaml. Matches
+    # the API-agent path, which leaves sampling to the provider's defaults.
+    self.gen_params = SamplingParams(max_tokens=max_tokens, **sampling_kwargs)
+
+    # Async-batching plumbing. Concurrent _async_completions calls are coalesced
+    # into a single LLM.generate() so vLLM gets a real batch without callers
+    # having to know about the distinction.
+    self._batch_queue: asyncio.Queue | None = None
+    self._batch_worker_task: asyncio.Task | None = None
+
+  @staticmethod
+  def _extract_final_response(raw_text: str) -> str:
+    """Strip thinking/reasoning channels from raw decoded output.
+
+    Handles gpt-oss <|channel|>final<|message|>...<|end|> and Qwen3 </think>
+    structures. Falls back to the raw text if neither marker is present.
+    """
+    if m := re.search(r'<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|$)', raw_text, re.DOTALL):
+      return m.group(1).strip()
+    if m := re.search(r'</think>(.*)', raw_text, re.DOTALL):
+      return m.group(1).strip()
+    return raw_text.strip()
+
+  def _format_prompts(self, all_messages: list[list[dict]]) -> list[str]:
+    return [
+      self.tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True,
+        enable_thinking=self.enable_thinking,
+      )
+      for msgs in all_messages
+    ]
+
+  def batch_completions(self, all_messages: list[list[dict]], **kwargs) -> list[LLMResponse]:
+    """Generate one response per chat in `all_messages`.
+
+    vLLM batches prompts internally — calling `generate` once with the full
+    list is far more efficient than per-call async dispatch.
+    """
+    formatted = self._format_prompts(all_messages)
+    gen_kwargs = {}
+    if self.lora_request is not None:
+      gen_kwargs["lora_request"] = self.lora_request
+    outputs = self.llm.generate(formatted, self.gen_params, **gen_kwargs)
+
+    results: list[LLMResponse] = []
+    for o in outputs:
+      raw = self.tokenizer.decode(o.outputs[0].token_ids, skip_special_tokens=False)
+      content = self._extract_final_response(raw)
+      input_tokens = len(getattr(o, "prompt_token_ids", []) or [])
+      output_tokens = len(o.outputs[0].token_ids)
+      usage = TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+      )
+      self._update_usage(usage)
+      results.append(LLMResponse(content=content, token_usage=usage))
+    return results
+
+  def _completions(self, messages, **kwargs) -> LLMResponse:
+    return self.batch_completions([messages], **kwargs)[0]
+
+  async def _batch_worker(self):
+    """Drain the request queue and dispatch each available batch to vLLM.
+
+    The first call to `_async_completions` starts this worker; gather()-style
+    bursts pile up in the queue while the worker is busy with the previous
+    batch, so subsequent batches are large even though no debounce is used.
+    """
+    while True:
+      first_msgs, first_fut = await self._batch_queue.get()
+      pending = [(first_msgs, first_fut)]
+      # Drain anything else available immediately — vLLM batches better with
+      # more prompts in a single generate() call.
+      while True:
+        try:
+          pending.append(self._batch_queue.get_nowait())
+        except asyncio.QueueEmpty:
+          break
+      messages_list = [p[0] for p in pending]
+      futures = [p[1] for p in pending]
+      try:
+        responses = await asyncio.to_thread(self.batch_completions, messages_list)
+        for fut, resp in zip(futures, responses):
+          if not fut.done():
+            fut.set_result(resp)
+      except Exception as exc:
+        for fut in futures:
+          if not fut.done():
+            fut.set_exception(exc)
+
+  async def _async_completions(self, messages, **kwargs) -> LLMResponse:
+    """Submit one chat to the shared batching queue and await the result."""
+    loop = asyncio.get_running_loop()
+    if self._batch_queue is None:
+      self._batch_queue = asyncio.Queue()
+      self._batch_worker_task = loop.create_task(self._batch_worker())
+    fut = loop.create_future()
+    await self._batch_queue.put((messages, fut))
+    return await fut
+
+
+# =================== Utils ===================
+_DEFAULT_MODELS_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "models.yaml")
+
+
+def get_agent_config(model: str, models_config_path: str = _DEFAULT_MODELS_YAML) -> Dict[str, Any]:
+    """
+    Load model configuration and format it for llm_agents.
+    Expected Config files to be something like this:
+    ```
+    gpt-5:
+      model: openai/gpt-5
+      generation_config:
+        reasoning_effort: high
+    ```
+    
+    Args:
+        model: Model name to load
+        models_config_path: Path to models configuration YAML file
+        
+    Returns:
+        Dictionary with agent configuration {model: str, generation_config: dict}
+    """
+    with open(models_config_path, "r") as f:
+        model_configs = yaml.safe_load(f)
+
+    assert model in model_configs, f"Model '{model}' not found in {models_config_path}. Available models: {list(model_configs.keys())}"
+    print("==== Model config: ", model_configs[model])
+    return model_configs[model]
+
+def sum_token_usage(token_usages: list[TokenUsage]):
+  input_tokens = sum(t.input_tokens for t in token_usages)
+  output_tokens = sum(t.output_tokens for t in token_usages)
+  total_tokens = sum(t.total_tokens for t in token_usages)
+  cached_tokens = sum(t.cached_tokens for t in token_usages)
+  cost = sum(t.cost for t in token_usages)
+  return TokenUsage(input_tokens=input_tokens, 
+                    output_tokens=output_tokens, 
+                    total_tokens=total_tokens, 
+                    cached_tokens=cached_tokens,
+                    cost=cost)
+
+def get_max_token_usage(token_usages: list[TokenUsage]):
+  return TokenUsage(input_tokens=max(t.input_tokens for t in token_usages), 
+                    output_tokens=max(t.output_tokens for t in token_usages), 
+                    total_tokens=max(t.total_tokens for t in token_usages), 
+                    cached_tokens=max(t.cached_tokens for t in token_usages),
+                    cost=max(t.cost for t in token_usages))
