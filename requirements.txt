@@ -1,0 +1,27 @@
+# Core ML / RL
+torch>=2.6.0
+transformers>=5.5.0
+trl>=1.1.0
+peft>=0.13.0
+vllm>=0.17.1
+accelerate>=1.0.0
+weave
+
+# Training utilities
+fire
+datasets
+pydantic
+requests
+
+# LLM API clients
+litellm>=1.55.0
+openai
+anthropic
+google-generativeai
+
+# Misc
+aiohttp
+python-dotenv
+pyyaml
+tqdm
+wandb
